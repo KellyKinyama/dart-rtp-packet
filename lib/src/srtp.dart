@@ -1,5 +1,5 @@
 import 'dart:typed_data';
-import 'dart:math';
+// import 'dart:math';
 import 'package:pointycastle/export.dart';
 import 'package:crypto/crypto.dart';
 
@@ -174,15 +174,30 @@ class SrtpSession {
   Uint8List _buildIv(int ssrc, int index) {
     final iv = Uint8List(16);
 
-    iv[4] = (ssrc >> 24) & 0xFF;
-    iv[5] = (ssrc >> 16) & 0xFF;
-    iv[6] = (ssrc >> 8) & 0xFF;
-    iv[7] = ssrc & 0xFF;
+    // ✅ Step 1: copy salt (14 bytes)
+    iv.setRange(0, 14, _rtpSalt);
 
-    iv[8] = (index >> 24) & 0xFF;
-    iv[9] = (index >> 16) & 0xFF;
-    iv[10] = (index >> 8) & 0xFF;
-    iv[11] = index & 0xFF;
+    // last 2 bytes = 0
+    iv[14] = 0;
+    iv[15] = 0;
+
+    // ✅ Step 2: XOR SSRC into bytes 4..7
+    iv[4] ^= (ssrc >> 24) & 0xFF;
+    iv[5] ^= (ssrc >> 16) & 0xFF;
+    iv[6] ^= (ssrc >> 8) & 0xFF;
+    iv[7] ^= ssrc & 0xFF;
+
+    // ✅ Step 3: XOR packet index (48-bit) into 8..13
+    final hi = (index >> 16) & 0xFFFFFFFF;
+    final lo = index & 0xFFFF;
+
+    iv[8] ^= (hi >> 8) & 0xFF;
+    iv[9] ^= hi & 0xFF;
+
+    // iv[10], iv[11] remain salt
+
+    iv[12] ^= (lo >> 8) & 0xFF;
+    iv[13] ^= lo & 0xFF;
 
     return iv;
   }

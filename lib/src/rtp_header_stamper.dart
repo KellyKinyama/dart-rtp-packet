@@ -1,4 +1,4 @@
-import 'dart:typed_data';
+// import 'dart:typed_data';
 import 'rtp.dart';
 
 class RtpHeaderStamper {
@@ -19,9 +19,9 @@ class RtpHeaderStamper {
     Map<String, int>? extMap,
     String? mid,
     int initialTransportCcSeq = 0,
-  })  : _extMap = extMap ?? {},
-        _mid = mid,
-        _twccSeq = initialTransportCcSeq & 0xFFFF {
+  }) : _extMap = extMap ?? {},
+       _mid = mid,
+       _twccSeq = initialTransportCcSeq & 0xFFFF {
     if (_mid != null && _extMap['mid'] != null) {
       _midPayload = Buffer.fromList(_mid!.codeUnits);
     }
@@ -77,10 +77,7 @@ class RtpHeaderStamper {
 
   // ✅ read SSRC directly (fast path)
   int _readSsrc(Buffer pkt) {
-    return ((pkt[8] << 24) |
-            (pkt[9] << 16) |
-            (pkt[10] << 8) |
-            pkt[11]) &
+    return ((pkt[8] << 24) | (pkt[9] << 16) | (pkt[10] << 8) | pkt[11]) &
         0xFFFFFFFF;
   }
 
@@ -131,8 +128,7 @@ class RtpHeaderStamper {
 
     if (repairedRid != null) {
       _repairedRidBySsrc[key] = repairedRid;
-      _repairedRidPayloadCache[key] =
-          Buffer.fromList(repairedRid.codeUnits);
+      _repairedRidPayloadCache[key] = Buffer.fromList(repairedRid.codeUnits);
     }
   }
 
