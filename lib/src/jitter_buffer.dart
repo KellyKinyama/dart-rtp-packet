@@ -166,7 +166,6 @@ int _seqDiff(int a, int b) {
   return d > 0x8000 ? d - 0x10000 : d;
 }
 
-
 // void main(){
 //   final jb = JitterBuffer(
 //   latencyMs: 50,

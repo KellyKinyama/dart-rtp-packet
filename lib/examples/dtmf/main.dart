@@ -10,7 +10,9 @@ void main() async {
   final receiverSocket = RtpSocket();
   await receiverSocket.bind(5002);
 
-  final packetizer = DTMFPacketizer({'ssrc': 5555, 'payloadType': 101});
+  final packetizer = DTMFPacketizer(
+    RtpPacketizerConfig(ssrc: 5555, payloadType: 101),
+  );
 
   final sender = DtmfSender(
     packetizer: packetizer,
@@ -30,35 +32,30 @@ void main() async {
   int? _lastEvent;
   bool _ended = false;
 
-  final receiver = DTMFDepacketizer({
-    'output': (chunk) {
-      final event = chunk['event'];
-      final symbol = chunk['symbol'];
+  final receiver = DTMFDepacketizer(
+    RtpDepacketizerCallbacks<DtmfEvent>(
+      onFrame: (evt) {
+        // ✅ new digit detected → reset state
+        if (_lastEvent != evt.event) {
+          _ended = false;
+        }
 
-      // ✅ new digit detected → reset state
-      if (_lastEvent != event) {
-        _ended = false;
-      }
+        // ✅ only fire ONCE
+        if (evt.end && !_ended) {
+          print('✅ DIGIT COMPLETE: ${evt.symbol}');
+          _ended = true;
+        }
 
-      // ✅ only fire ONCE
-      if (chunk['end'] == true && !_ended) {
-        print("✅ DIGIT COMPLETE: $symbol");
-        _ended = true;
-      }
-
-      _lastEvent = event;
-    },
-  });
+        _lastEvent = evt.event;
+      },
+    ),
+  );
 
   receiverSocket.listen((data) {
     final pkt = parseRtp(Buffer.from(data.buffer, 0, data.length));
 
     if (pkt != null) {
-      receiver.depacketize({
-        'payload': pkt.payload,
-        'timestamp': pkt.timestamp,
-        'marker': pkt.marker,
-      });
+      receiver.depacketize(pkt);
     }
   });
 

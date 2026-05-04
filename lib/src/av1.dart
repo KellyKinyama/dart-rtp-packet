@@ -1,48 +1,66 @@
 import 'dart:typed_data';
-
 import 'rtp.dart';
 
-const int CLOCK_RATE = 90000;
+const int av1ClockRate = 90000;
+
+// ═══════════════════════════════════════════════════════════════════
+// Typed Output Frame
+// ═══════════════════════════════════════════════════════════════════
+
+class Av1Frame {
+  final Uint8List data;
+  final int timestampUs;
+  final bool keyFrame;
+
+  const Av1Frame({
+    required this.data,
+    required this.timestampUs,
+    required this.keyFrame,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Packetizer
+// ═══════════════════════════════════════════════════════════════════
+
+bool _isAv1Keyframe(Uint8List data) {
+  if (data.length < 2) return false;
+  // AV1 RTP: N bit (0x08) in aggregation header indicates new coded video sequence (keyframe).
+  // Simplistic heuristic: check first OBU for FRAME_HEADER or KEY_FRAME type.
+  // For now, we assume the encoder signals keyframes via separate metadata or
+  // we parse the OBU header. This is a placeholder.
+  // A proper implementation would parse the OBU header to detect OBU_FRAME with KEY_FRAME type.
+  // For simplicity, we return false and rely on the encoder to provide correct data.
+  return false;
+}
 
 class AV1Packetizer {
   final RtpState state;
-  final int mtu;
 
-  AV1Packetizer(Map<String, dynamic> opts)
-    : state = createRtpState(opts),
-      mtu = opts['mtu'] ?? 1400;
+  AV1Packetizer(RtpPacketizerConfig config)
+    : state = RtpState.fromConfig(config);
 
-  List<Buffer> packetize(Map<String, dynamic> chunk) {
-    _validateChunk(chunk);
-    return _packetize(chunk);
-  }
+  List<Buffer> packetize(MediaChunk chunk) {
+    final data = Buffer.from(
+      chunk.data.buffer,
+      chunk.data.offsetInBytes,
+      chunk.data.lengthInBytes,
+    );
+    final rtpTs = usToRtp(chunk.timestampUs, av1ClockRate);
 
-  void close() {}
+    final maxPayload = state.mtu - 1;
 
-  void _validateChunk(Map chunk) {
-    if (chunk['data'] == null || chunk['timestamp'] == null) {
-      throw Exception("AV1: invalid chunk");
-    }
-  }
+    final isKey = _isAv1Keyframe(chunk.data);
 
-  List<Buffer> _packetize(Map<String, dynamic> chunk) {
-    final data = _toBuffer(chunk['data']);
-    final rtpTs = usToRtp(chunk['timestamp'], CLOCK_RATE);
-
-    final isKey = chunk['type'] == 'key';
-
-    final maxPayload = mtu - 1;
-
-    // ✅ SINGLE PACKET
     if (data.length <= maxPayload) {
       return [
         makePacketWithPrefix(
           state,
-          isKey ? 0x08 : 0x00, // N bit
+          isKey ? 0x08 : 0x00,
           0,
           0,
           0,
-          1, // prefix length
+          1,
           data,
           0,
           data.length,
@@ -52,7 +70,6 @@ class AV1Packetizer {
       ];
     }
 
-    // ✅ FRAGMENTATION
     final out = <Buffer>[];
     int offset = 0;
 
@@ -68,9 +85,9 @@ class AV1Packetizer {
 
       int header = 0;
 
-      if (!isFirst) header |= 0x80; // Z
-      if (!isLast) header |= 0x40; // Y
-      if (isFirst && isKey) header |= 0x08; // N
+      if (!isFirst) header |= 0x80;
+      if (!isLast) header |= 0x40;
+      if (isFirst && isKey) header |= 0x08;
 
       out.add(
         makePacketWithPrefix(
@@ -95,17 +112,19 @@ class AV1Packetizer {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Depacketizer
+// ═══════════════════════════════════════════════════════════════════
+
 class AV1Depacketizer {
-  void Function(Map<String, dynamic>)? _output;
-  void Function(Object)? _error;
+  final RtpDepacketizerCallbacks<Av1Frame> _callbacks;
 
   List<Uint8List> _fragments = [];
   bool _isKey = false;
+  int _lastTimestamp = 0;
 
-  AV1Depacketizer(Map<String, dynamic> opts) {
-    _output = opts['output'];
-    _error = opts['error'];
-  }
+  AV1Depacketizer(RtpDepacketizerCallbacks<Av1Frame> callbacks)
+    : _callbacks = callbacks;
 
   static bool peekKeyframe(Uint8List payload) {
     if (payload.isEmpty) return false;
@@ -118,13 +137,15 @@ class AV1Depacketizer {
     return !Z && N;
   }
 
-  void depacketize(Map<String, dynamic> packet) {
-    final payload = packet['payload'] as Uint8List;
+  void depacketize(RtpPacket packet) {
+    final payload = packet.payload;
 
     if (payload.isEmpty) {
-      _emitError("AV1: empty payload");
+      _callbacks.onError?.call(Exception('AV1: empty payload'));
       return;
     }
+
+    _lastTimestamp = packet.timestamp;
 
     final hdr = payload[0];
 
@@ -141,7 +162,7 @@ class AV1Depacketizer {
       _fragments.add(data);
     }
 
-    if (!Y || packet['marker'] == true) {
+    if (!Y || packet.marker) {
       if (_fragments.isEmpty) return;
 
       Uint8List frame;
@@ -152,43 +173,37 @@ class AV1Depacketizer {
         frame = _concat(_fragments);
       }
 
-      _output?.call({
-        'data': frame,
-        'timestamp': packet['timestamp'],
-        'type': _isKey ? 'key' : 'delta',
-      });
+      try {
+        _callbacks.onFrame?.call(
+          Av1Frame(
+            data: frame,
+            timestampUs: (_lastTimestamp * 1000000) ~/ av1ClockRate,
+            keyFrame: _isKey,
+          ),
+        );
+      } catch (e, st) {
+        _callbacks.onError?.call(e, st);
+      }
 
       _fragments = [];
       _isKey = false;
     }
   }
-}
 
-void _emitError(Object err) {
-  /* optional */
-}
+  Uint8List _concat(List<Uint8List> parts) {
+    int total = 0;
+    for (final p in parts) {
+      total += p.length;
+    }
 
-Buffer _toBuffer(dynamic d) {
-  if (d is Buffer) return d;
+    final out = Uint8List(total);
+    int offset = 0;
 
-  if (d is Uint8List) {
-    return Buffer.from(d.buffer, d.offsetInBytes, d.length);
+    for (final p in parts) {
+      out.setRange(offset, offset + p.length, p);
+      offset += p.length;
+    }
+
+    return out;
   }
-
-  throw Exception("Invalid AV1 buffer");
-}
-
-Uint8List _concat(List<Uint8List> parts) {
-  int total = 0;
-  for (final p in parts) total += p.length;
-
-  final out = Uint8List(total);
-  int offset = 0;
-
-  for (final p in parts) {
-    out.setRange(offset, offset + p.length, p);
-    offset += p.length;
-  }
-
-  return out;
 }

@@ -1,7 +1,27 @@
 import 'dart:typed_data';
 import 'rtp.dart';
 
-const int G711_CLOCK_RATE = 8000;
+const int g711ClockRate = 8000; // RFC 3551 §4.5
+
+// RFC 3551 §4.5.14: Static payload types for G.711
+enum G711Codec {
+  pcmu(0),
+  pcma(8);
+
+  final int payloadType;
+  const G711Codec(this.payloadType);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Typed Output Frame
+// ═══════════════════════════════════════════════════════════════════
+
+class G711Frame {
+  final Uint8List data;
+  final int timestampUs;
+
+  const G711Frame({required this.data, required this.timestampUs});
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // Packetizer
@@ -10,40 +30,25 @@ const int G711_CLOCK_RATE = 8000;
 class G711Packetizer {
   final RtpState state;
 
-  G711Packetizer(Map<String, dynamic> opts) : state = createRtpState(opts);
+  G711Packetizer(RtpPacketizerConfig config)
+    : state = RtpState.fromConfig(config);
 
-  /// Standard packetize (returns Buffer[])
-  List<Buffer> packetize(Map<String, dynamic> chunk) {
-    _validateChunk(chunk);
-    return _packetize(chunk, false).cast<Buffer>();
-  }
+  List<Buffer> packetize(MediaChunk chunk, {bool marker = false}) {
+    final data = Buffer.from(
+      chunk.data.buffer,
+      chunk.data.offsetInBytes,
+      chunk.data.lengthInBytes,
+    );
+    // RFC 3551 §4.5.14: one sample per byte at 8000 Hz
+    final rtpTs = usToRtp(chunk.timestampUs, g711ClockRate);
 
-  /// Packetize with metadata
-  List<dynamic> packetizeWithMeta(Map<String, dynamic> chunk) {
-    _validateChunk(chunk);
-    return _packetize(chunk, true);
-  }
-
-  void close() {}
-
-  List<dynamic> _packetize(Map<String, dynamic> chunk, bool withMeta) {
-    final data = toBuffer(chunk['data'])!;
-    final rtpTs = usToRtp(chunk['timestamp'], G711_CLOCK_RATE);
-    final marker = chunk['marker'] == true;
-
-    // ✅ Fast path (most common)
     if (data.length <= state.mtu) {
-      return [makePacket(state, data, rtpTs, marker, withMeta)];
+      return [makeRtpPacket(state, data, rtpTs, marker)];
     }
 
-    // ⚠️ Large block (rare)
-    print(
-      'G711Packetizer warning: block ${data.length} > MTU ${state.mtu}, splitting',
-    );
-
-    final List<dynamic> out = [];
+    // RFC 3551: when fragmenting, all fragments share the same timestamp
+    final List<Buffer> out = [];
     int offset = 0;
-    int fragIndex = 0;
 
     while (offset < data.length) {
       final size = (data.length - offset > state.mtu)
@@ -51,39 +56,21 @@ class G711Packetizer {
           : data.length - offset;
 
       final slice = data.subarray(offset, offset + size);
-
-      final fragTs = (rtpTs + offset) & 0xFFFFFFFF;
+      final isFirst = (offset == 0);
 
       out.add(
-        makePacket(
+        makeRtpPacket(
           state,
           Buffer.from(slice.buffer, slice.offsetInBytes, slice.length),
-          fragTs,
-          fragIndex == 0 && marker,
-          withMeta,
+          rtpTs, // same timestamp for all fragments
+          isFirst && marker,
         ),
       );
 
       offset += size;
-      fragIndex++;
     }
 
     return out;
-  }
-}
-
-void _validateChunk(Map<String, dynamic> chunk) {
-  if (chunk['timestamp'] == null) {
-    throw ArgumentError('chunk.timestamp required');
-  }
-
-  if (chunk['data'] == null && chunk['nalus'] == null) {
-    throw ArgumentError('chunk.data required');
-  }
-
-  final data = chunk['data'];
-  if (data != null && data is! Buffer && data is! Uint8List) {
-    throw ArgumentError('chunk.data must be Buffer or Uint8List');
   }
 }
 
@@ -92,50 +79,28 @@ void _validateChunk(Map<String, dynamic> chunk) {
 // ═══════════════════════════════════════════════════════════════════
 
 class G711Depacketizer {
-  void Function(Map<String, dynamic>)? _output;
-  void Function(Object)? _error;
+  final RtpDepacketizerCallbacks<G711Frame> _callbacks;
 
-  G711Depacketizer(Map<String, dynamic> opts) {
-    if (opts['output'] == null || opts['output'] is! Function) {
-      throw ArgumentError('G711Depacketizer: output callback is required');
-    }
-
-    _output = opts['output'];
-    _error = (opts['error'] is Function) ? opts['error'] : null;
-  }
+  G711Depacketizer(RtpDepacketizerCallbacks<G711Frame> callbacks)
+    : _callbacks = callbacks;
 
   static bool peekKeyframe() => false;
 
-  void depacketize(Map<String, dynamic>? packet) {
-    if (packet == null ||
-        packet['payload'] == null ||
-        (packet['payload'] as Uint8List).isEmpty) {
-      _emitError(Exception('G711Depacketizer: empty or missing payload'));
+  void depacketize(RtpPacket packet) {
+    if (packet.payload.isEmpty) {
+      _callbacks.onError?.call(Exception('G.711: empty payload'));
       return;
     }
 
-    _output?.call({
-      'data': packet['payload'],
-      'timestamp': packet['timestamp'],
-      'type': 'key',
-      'marker': packet['marker'] == true,
-    });
-  }
-
-  void _emitError(Object err) {
-    if (_error == null) return;
-
     try {
-      _error!(err);
-    } catch (e) {
-      print('G711Depacketizer error callback threw: $e');
+      _callbacks.onFrame?.call(
+        G711Frame(
+          data: packet.payload,
+          timestampUs: (packet.timestamp * 1000000) ~/ g711ClockRate,
+        ),
+      );
+    } catch (e, st) {
+      _callbacks.onError?.call(e, st);
     }
-  }
-
-  void reset() {}
-
-  void close() {
-    _output = null;
-    _error = null;
   }
 }

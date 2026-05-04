@@ -1,10 +1,82 @@
-import 'dart:typed_data';
-
 import 'rtp.dart';
 
-const int DEFAULT_CLOCK_RATE = 8000;
+const int dtmfClockRate = 8000; // RFC 4733 §2.5
 
-const Map<String, int> EVENT_NAMES = {
+// RFC 4733 §3 Table 1: Named event codes
+enum DtmfDigit {
+  d0(0),
+  d1(1),
+  d2(2),
+  d3(3),
+  d4(4),
+  d5(5),
+  d6(6),
+  d7(7),
+  d8(8),
+  d9(9),
+  star(10),
+  hash(11),
+  a(12),
+  b(13),
+  c(14),
+  d(15),
+  flash(16);
+
+  final int code;
+  const DtmfDigit(this.code);
+
+  static DtmfDigit? fromString(String s) {
+    switch (s.toUpperCase()) {
+      case '0':
+        return d0;
+      case '1':
+        return d1;
+      case '2':
+        return d2;
+      case '3':
+        return d3;
+      case '4':
+        return d4;
+      case '5':
+        return d5;
+      case '6':
+        return d6;
+      case '7':
+        return d7;
+      case '8':
+        return d8;
+      case '9':
+        return d9;
+      case '*':
+        return star;
+      case '#':
+        return hash;
+      case 'A':
+        return a;
+      case 'B':
+        return b;
+      case 'C':
+        return c;
+      case 'D':
+        return d;
+      default:
+        return null;
+    }
+  }
+
+  String get symbol {
+    if (code >= 0 && code <= 9) return code.toString();
+    if (code == 10) return '*';
+    if (code == 11) return '#';
+    if (code >= 12 && code <= 15) {
+      return String.fromCharCode(65 + code - 12); // A-D
+    }
+    return '?';
+  }
+}
+
+// Legacy map for backward compatibility (internal use only)
+const Map<String, int> eventNames = {
   '0': 0,
   '1': 1,
   '2': 2,
@@ -23,106 +95,111 @@ const Map<String, int> EVENT_NAMES = {
   'D': 15,
 };
 
+// ═══════════════════════════════════════════════════════════════════
+// Typed DTMF Event
+// ═══════════════════════════════════════════════════════════════════
+
+class DtmfEvent {
+  final int event;
+  final int volume;
+  final int durationSamples;
+  final bool end;
+  final int timestampUs;
+
+  const DtmfEvent({
+    required this.event,
+    required this.volume,
+    required this.durationSamples,
+    required this.end,
+    required this.timestampUs,
+  });
+
+  String? get symbol {
+    for (final entry in eventNames.entries) {
+      if (entry.value == event) return entry.key;
+    }
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Typed Input for Packetizer
+// ═══════════════════════════════════════════════════════════════════
+
+class DtmfChunk {
+  final int timestampUs;
+  final int event;
+  final int durationSamples;
+  final int volume;
+  final bool end;
+  final bool marker; // RFC 4733 §2.3.1: true for first packet of event
+
+  const DtmfChunk({
+    required this.timestampUs,
+    required this.event,
+    required this.durationSamples,
+    this.volume = 10,
+    this.end = false,
+    this.marker = false,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Packetizer
+// ═══════════════════════════════════════════════════════════════════
+
 class DTMFPacketizer {
   final RtpState state;
-  final int clockRate;
 
-  DTMFPacketizer(Map<String, dynamic> opts)
-    : state = createRtpState(opts),
-      clockRate = opts['clockRate'] ?? DEFAULT_CLOCK_RATE;
+  DTMFPacketizer(RtpPacketizerConfig config)
+    : state = RtpState.fromConfig(config);
 
-  List<Buffer> packetize(Map<String, dynamic> chunk) {
-    return [_packetize(chunk, false)];
-  }
+  /// RFC 4733 §2.5.1.4: End packets MUST be retransmitted 3 times with same timestamp
+  /// RFC 4733 §2.3.1: Marker bit MUST be set on first packet of event
+  List<Buffer> packetize(DtmfChunk chunk) {
+    final rtpTs = usToRtp(chunk.timestampUs, dtmfClockRate);
 
-  List<Map<String, dynamic>> packetizeWithMeta(Map<String, dynamic> chunk) {
-    final pkt = _packetize(chunk, true);
-
-    return [
-      {
-        'buffer': pkt,
-        'timestamp': chunk['timestamp'],
-        'marker': chunk['marker'] == true,
-        // you can extend later
-      },
-    ];
-  }
-
-  Buffer _packetize(Map<String, dynamic> chunk, bool withMeta) {
-    if (chunk['timestamp'] == null) {
-      throw Exception("DTMF: timestamp required");
-    }
-
-    if (chunk['durationSamples'] == null) {
-      throw Exception("DTMF: durationSamples required");
-    }
-
-    int event = _resolveEvent(chunk['event']);
-
-    final volume = (chunk['volume'] ?? 10) & 0x3F;
-    final endBit = (chunk['end'] == true) ? 0x80 : 0;
+    final volume = chunk.volume & 0x3F; // RFC 4733 §2.5: bits 6-7 reserved
+    final endBit = chunk.end ? 0x80 : 0;
 
     final payload = Buffer.allocUnsafe(4);
 
-    payload[0] = event & 0xFF;
-    payload[1] = endBit | (volume & 0x3F);
+    payload[0] = chunk.event & 0xFF;
+    payload[1] = endBit | volume;
 
-    final dur = chunk['durationSamples'];
+    final dur = chunk.durationSamples;
     payload[2] = (dur >> 8) & 0xFF;
     payload[3] = dur & 0xFF;
 
-    final rtpTs = usToRtp(chunk['timestamp'], clockRate);
+    // RFC 4733 §2.3.1: marker bit on first packet only
+    final pkt = makeRtpPacket(state, payload, rtpTs, chunk.marker);
 
-    return makePacket(state, payload, rtpTs, chunk['marker'] == true, withMeta);
-  }
-
-  int _resolveEvent(dynamic e) {
-    if (e is int) {
-      if (e < 0 || e > 255) {
-        throw Exception("DTMF: event out of range");
-      }
-      return e;
+    // RFC 4733 §2.5.1.4: retransmit end packet 3 times
+    if (chunk.end) {
+      return [pkt, pkt, pkt];
     }
 
-    if (e is String) {
-      final key = e.toUpperCase();
-      final v = EVENT_NAMES[key];
-      if (v == null) {
-        throw Exception("DTMF: invalid symbol $e");
-      }
-      return v;
-    }
-
-    throw Exception("DTMF: invalid event type");
+    return [pkt];
   }
-
-  void close() {}
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Depacketizer
+// ═══════════════════════════════════════════════════════════════════
+
 class DTMFDepacketizer {
-  void Function(Map<String, dynamic>)? _output;
-  void Function(Object)? _error;
+  final RtpDepacketizerCallbacks<DtmfEvent> _callbacks;
 
-  static final List<String?> _symbolReverse = () {
-    final list = List<String?>.filled(16, null);
+  DTMFDepacketizer(RtpDepacketizerCallbacks<DtmfEvent> callbacks)
+    : _callbacks = callbacks;
 
-    EVENT_NAMES.forEach((k, v) {
-      list[v] = k;
-    });
+  static bool peekKeyframe() => false;
 
-    return list;
-  }();
-
-  DTMFDepacketizer(Map<String, dynamic> opts) {
-    _output = opts['output'];
-    _error = opts['error'];
-  }
-
-  void depacketize(Map<String, dynamic> packet) {
-    final payload = packet['payload'] as Uint8List;
+  void depacketize(RtpPacket packet) {
+    final payload = packet.payload;
 
     if (payload.length < 4) {
-      _emitError("DTMF payload too small");
+      _callbacks.onError?.call(Exception('DTMF payload too small'));
       return;
     }
 
@@ -134,29 +211,18 @@ class DTMFDepacketizer {
 
     final duration = (payload[2] << 8) | payload[3];
 
-    _output?.call({
-      'event': event,
-      'end': end,
-      'volume': volume,
-      'durationSamples': duration,
-      'timestamp': packet['timestamp'],
-      'marker': packet['marker'] == true,
-      'symbol': (event < 16) ? _symbolReverse[event] : null,
-    });
-  }
-
-  void _emitError(Object err) {
-    _error?.call(err);
-  }
-
-  static bool peekKeyframe() {
-    return false;
-  }
-
-  void reset() {}
-
-  void close() {
-    _output = null;
-    _error = null;
+    try {
+      _callbacks.onFrame?.call(
+        DtmfEvent(
+          event: event,
+          volume: volume,
+          durationSamples: duration,
+          end: end,
+          timestampUs: (packet.timestamp * 1000000) ~/ dtmfClockRate,
+        ),
+      );
+    } catch (e, st) {
+      _callbacks.onError?.call(e, st);
+    }
   }
 }

@@ -32,24 +32,18 @@ Map<String, dynamic>? parseTransportCC(Buffer fci) {
       final s = (chunk >> 13) & 0x3;
       final runLen = chunk & 0x1FFF;
 
-      for (int i = 0;
-          i < runLen && symbols.length < packetCount;
-          i++) {
+      for (int i = 0; i < runLen && symbols.length < packetCount; i++) {
         symbols.add(s);
       }
     } else {
       final symbolSize = (chunk >> 14) & 1;
 
       if (symbolSize == 0) {
-        for (int i = 13;
-            i >= 0 && symbols.length < packetCount;
-            i--) {
+        for (int i = 13; i >= 0 && symbols.length < packetCount; i--) {
           symbols.add(((chunk >> i) & 1) == 1 ? 1 : 0);
         }
       } else {
-        for (int i = 6;
-            i >= 0 && symbols.length < packetCount;
-            i--) {
+        for (int i = 6; i >= 0 && symbols.length < packetCount; i--) {
           symbols.add((chunk >> (i * 2)) & 0x3);
         }
       }
@@ -63,11 +57,7 @@ Map<String, dynamic>? parseTransportCC(Buffer fci) {
     final sym = symbols[i];
 
     if (sym == 0 || sym == 3) {
-      packets.add({
-        'seq': seq,
-        'received': sym != 0,
-        'deltaUs': null,
-      });
+      packets.add({'seq': seq, 'received': sym != 0, 'deltaUs': null});
       continue;
     }
 
@@ -75,22 +65,14 @@ Map<String, dynamic>? parseTransportCC(Buffer fci) {
       if (off + 1 > fci.length) return null;
 
       final d8 = fci[off++];
-      packets.add({
-        'seq': seq,
-        'received': true,
-        'deltaUs': d8 * 250,
-      });
+      packets.add({'seq': seq, 'received': true, 'deltaUs': d8 * 250});
     } else {
       if (off + 2 > fci.length) return null;
 
       final d16 = fci.readInt16BE(off);
       off += 2;
 
-      packets.add({
-        'seq': seq,
-        'received': true,
-        'deltaUs': d16 * 250,
-      });
+      packets.add({'seq': seq, 'received': true, 'deltaUs': d16 * 250});
     }
   }
 
@@ -110,20 +92,14 @@ Map<String, dynamic>? parseTransportCC(Buffer fci) {
 Map<String, dynamic>? parseREMB(Buffer fci) {
   if (fci.length < 8) return null;
 
-  if (fci[0] != 0x52 ||
-      fci[1] != 0x45 ||
-      fci[2] != 0x4D ||
-      fci[3] != 0x42) {
+  if (fci[0] != 0x52 || fci[1] != 0x45 || fci[2] != 0x4D || fci[3] != 0x42) {
     return null;
   }
 
   final numSsrc = fci[4];
   final exp = (fci[5] >> 2) & 0x3F;
 
-  final mantissa =
-      ((fci[5] & 0x03) << 16) |
-      (fci[6] << 8) |
-      fci[7];
+  final mantissa = ((fci[5] & 0x03) << 16) | (fci[6] << 8) | fci[7];
 
   final bitrate = mantissa * math.pow(2, exp).toInt();
 
@@ -136,10 +112,7 @@ Map<String, dynamic>? parseREMB(Buffer fci) {
     ssrcs.add(fci.readUInt32BE(off));
   }
 
-  return {
-    'bitrate': bitrate,
-    'ssrcs': ssrcs,
-  };
+  return {'bitrate': bitrate, 'ssrcs': ssrcs};
 }
 
 // ==============================
@@ -201,13 +174,11 @@ class BandwidthEstimator {
       final rec = _sendHistory[seq];
       if (rec == null) continue;
 
-      if (prevSeq != null &&
-          _sendHistory.containsKey(prevSeq)) {
+      if (prevSeq != null && _sendHistory.containsKey(prevSeq)) {
         final deltaUs = p['deltaUs'];
         final sendDelta = rec.timeMs - prevSend;
 
-        final gradient =
-            deltaUs - (sendDelta * 1000);
+        final gradient = deltaUs - (sendDelta * 1000);
 
         totalGradient += gradient;
         count++;
@@ -222,9 +193,7 @@ class BandwidthEstimator {
     final avg = totalGradient / count;
 
     const alpha = 0.4;
-    _delayTrendMs =
-        (1 - alpha) * _delayTrendMs +
-        alpha * (avg / 1000);
+    _delayTrendMs = (1 - alpha) * _delayTrendMs + alpha * (avg / 1000);
 
     num next;
 
@@ -274,10 +243,7 @@ class TransportCCFeedbackGenerator {
 
   final List<_Arrival> _arrivals = [];
 
-  TransportCCFeedbackGenerator({
-    this.senderSsrc = 1,
-    this.mediaSsrc = 0,
-  });
+  TransportCCFeedbackGenerator({this.senderSsrc = 1, this.mediaSsrc = 0});
 
   void recordArrival(int seq, int timeMs) {
     seq &= 0xFFFF;
@@ -314,21 +280,14 @@ class TransportCCFeedbackGenerator {
       final seqI = arrs[0].seq + i;
 
       if (ai < arrs.length && arrs[ai].seq == seqI) {
-        final deltaUs =
-            (arrs[ai].timeMs - prevArrivalMs) * 1000;
+        final deltaUs = (arrs[ai].timeMs - prevArrivalMs) * 1000;
 
-        packets.add(TwccPacket(
-          received: true,
-          deltaUs: deltaUs,
-        ));
+        packets.add(TwccPacket(received: true, deltaUs: deltaUs));
 
         prevArrivalMs = arrs[ai].timeMs;
         ai++;
       } else {
-        packets.add(TwccPacket(
-          received: false,
-          deltaUs: 0,
-        ));
+        packets.add(TwccPacket(received: false, deltaUs: 0));
       }
     }
 

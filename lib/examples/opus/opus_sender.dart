@@ -1,8 +1,8 @@
 import 'dart:typed_data';
 
 import '../../src/opus.dart';
+import '../../src/rtp.dart';
 import '../rtp_socket.dart';
-// import 'rtp_socket.dart';
 
 class VoipSenderOpus {
   final RtpSocket socket;
@@ -15,20 +15,18 @@ class VoipSenderOpus {
     required this.socket,
     required this.remoteIp,
     required this.remotePort,
-  }) : packetizer = OpusPacketizer({
-          'ssrc': 9999,
-          'payloadType': 111, // standard Opus payload
-        });
+  }) : packetizer = OpusPacketizer(
+         RtpPacketizerConfig(ssrc: 9999, payloadType: 111),
+       );
 
   int timestamp = 0;
 
   /// Send ONE Opus frame
   void sendFrame(Uint8List opusFrame) {
     // ✅ packetize (always 1 packet)
-    final packets = packetizer.packetize({
-      'data': opusFrame,
-      'timestamp': timestamp,
-    });
+    final packets = packetizer.packetize(
+      MediaChunk(data: opusFrame, timestampUs: timestamp),
+    );
 
     // ✅ send
     for (final p in packets) {

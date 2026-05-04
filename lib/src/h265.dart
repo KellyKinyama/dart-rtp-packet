@@ -1,19 +1,90 @@
 import 'dart:typed_data';
 import 'rtp.dart';
 
-const int H265_CLOCK_RATE = 90000;
+const int h265ClockRate = 90000;
 
-const int NAL_AP = 48;
-const int NAL_FU = 49;
+// ═══════════════════════════════════════════════════════════════════
+// H.265 NAL Unit Types (RFC 7798 §1.1.4 Table 1)
+// ═══════════════════════════════════════════════════════════════════
+
+enum H265NaluType {
+  trailN(0),
+  trailR(1),
+  tsaN(2),
+  tsaR(3),
+  stsaN(4),
+  stsaR(5),
+  radlN(6),
+  radlR(7),
+  raslN(8),
+  raslR(9),
+  blaN(16),
+  blaR(17),
+  blaWRadl(18),
+  idrWRadl(19),
+  idrNLp(20),
+  craNut(21),
+  vpsNut(32),
+  spsNut(33),
+  ppsNut(34),
+  accessUnitDelimiter(35),
+  eosNut(36),
+  eobNut(37),
+  fillerData(38),
+  suffixSei(39),
+  prefixSei(40),
+  aggregationPacket(48),
+  fragmentationUnit(49),
+  paciPacket(50);
+
+  final int value;
+  const H265NaluType(this.value);
+
+  static H265NaluType fromByte(int b) {
+    final type = (b >> 1) & 0x3F;
+    return H265NaluType.values.firstWhere(
+      (e) => e.value == type,
+      orElse: () => H265NaluType.trailN,
+    );
+  }
+
+  bool get isKeyframe =>
+      this == H265NaluType.idrWRadl || this == H265NaluType.idrNLp;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Typed Output Frame
+// ═══════════════════════════════════════════════════════════════════
+
+class H265Frame {
+  final Uint8List annexB;
+  final int timestampUs;
+  final bool keyFrame;
+
+  const H265Frame({
+    required this.annexB,
+    required this.timestampUs,
+    required this.keyFrame,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Packetizer
+// ═══════════════════════════════════════════════════════════════════
 
 class H265Packetizer {
   final RtpState state;
 
-  H265Packetizer(Map<String, dynamic> opts) : state = createRtpState(opts);
+  H265Packetizer(RtpPacketizerConfig config)
+    : state = RtpState.fromConfig(config);
 
-  List<Buffer> packetize(Map<String, dynamic> chunk) {
-    final data = toBuffer(chunk['data'])!;
-    final rtpTs = usToRtp(chunk['timestamp'], H265_CLOCK_RATE);
+  List<Buffer> packetize(MediaChunk chunk) {
+    final data = Buffer.from(
+      chunk.data.buffer,
+      chunk.data.offsetInBytes,
+      chunk.data.lengthInBytes,
+    );
+    final rtpTs = usToRtp(chunk.timestampUs, h265ClockRate);
 
     final nalus = _splitNALUs(data);
     if (nalus.isEmpty) return const [];
@@ -25,7 +96,7 @@ class H265Packetizer {
       final isLast = i == nalus.length - 1;
 
       if (nalu.length <= state.mtu) {
-        out.add(makePacket(state, nalu, rtpTs, isLast, false) as Buffer);
+        out.add(makeRtpPacket(state, nalu, rtpTs, isLast));
       } else {
         _fragmentFU(nalu, rtpTs, isLast, out);
       }
@@ -41,8 +112,8 @@ class H265Packetizer {
     final origLo = nalu[1];
     final origType = (origHi >> 1) & 0x3F;
 
-    // FU payload header
-    final fuHdrHi = (origHi & 0x81) | (NAL_FU << 1);
+    // RFC 7798 §4.4.3: FU payload header (2 bytes) with type = 49
+    final fuHdrHi = (origHi & 0x81) | (49 << 1);
     final fuHdrLo = origLo;
 
     final maxPayload = state.mtu - 3;
@@ -112,37 +183,41 @@ class H265Packetizer {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Depacketizer
+// ═══════════════════════════════════════════════════════════════════
+
 class H265Depacketizer {
-  void Function(Map<String, dynamic>)? _output;
-  void Function(Object)? _error;
+  final RtpDepacketizerCallbacks<H265Frame> _callbacks;
 
   List<Uint8List> _nalus = [];
   List<Uint8List> _fuFragments = [];
 
   bool _sawIDR = false;
+  int _lastTimestamp = 0;
 
-  H265Depacketizer(Map<String, dynamic> opts) {
-    _output = opts['output'];
-    _error = opts['error'];
-  }
+  H265Depacketizer(RtpDepacketizerCallbacks<H265Frame> callbacks)
+    : _callbacks = callbacks;
 
-  void depacketize(Map<String, dynamic> packet) {
-    final payload = packet['payload'] as Uint8List;
+  void depacketize(RtpPacket packet) {
+    final payload = packet.payload;
 
     if (payload.length < 2) {
-      _emitError(Exception("H265: payload too small"));
+      _callbacks.onError?.call(Exception('H265: payload too small'));
       return;
     }
 
-    final naluType = (payload[0] >> 1) & 0x3F;
+    _lastTimestamp = packet.timestamp;
 
-    if (naluType < NAL_AP) {
+    final naluType = H265NaluType.fromByte(payload[0]);
+
+    if (naluType.value < 48) {
       _nalus.add(payload);
 
-      if (naluType == 19 || naluType == 20) {
+      if (naluType.isKeyframe) {
         _sawIDR = true;
       }
-    } else if (naluType == NAL_FU) {
+    } else if (naluType == H265NaluType.fragmentationUnit) {
       if (payload.length < 3) return;
 
       final fuByte = payload[2];
@@ -151,6 +226,7 @@ class H265Depacketizer {
       final origType = fuByte & 0x3F;
 
       if (start) {
+        // RFC 7798 §4.4.3: reconstruct 2-byte payload header
         final hdrHi = (payload[0] & 0x81) | (origType << 1);
         final hdrLo = payload[1];
 
@@ -167,7 +243,7 @@ class H265Depacketizer {
         final full = _concat(_fuFragments);
         _nalus.add(full);
 
-        if (((full[0] >> 1) & 0x3F) == 19 || ((full[0] >> 1) & 0x3F) == 20) {
+        if (H265NaluType.fromByte(full[0]).isKeyframe) {
           _sawIDR = true;
         }
 
@@ -175,14 +251,18 @@ class H265Depacketizer {
       }
     }
 
-    if (packet['marker'] == true && _nalus.isNotEmpty) {
-      final frame = _joinAnnexB(_nalus);
+    if (packet.marker && _nalus.isNotEmpty) {
+      final frame = H265Frame(
+        annexB: _joinAnnexB(_nalus),
+        timestampUs: (_lastTimestamp * 1000000) ~/ h265ClockRate,
+        keyFrame: _sawIDR,
+      );
 
-      _output?.call({
-        'data': frame,
-        'timestamp': packet['timestamp'],
-        'type': _sawIDR ? 'key' : 'delta',
-      });
+      try {
+        _callbacks.onFrame?.call(frame);
+      } catch (e, st) {
+        _callbacks.onError?.call(e, st);
+      }
 
       _nalus.clear();
       _sawIDR = false;
@@ -216,9 +296,5 @@ class H265Depacketizer {
     }
 
     return out;
-  }
-
-  void _emitError(Object e) {
-    _error?.call(e);
   }
 }

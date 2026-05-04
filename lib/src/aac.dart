@@ -1,63 +1,78 @@
 import 'dart:typed_data';
-
 import 'rtp.dart';
 
-// =============================
-// CONSTANTS
-// =============================
+const int aacClockRate = 48000;
+const int auHeaderBits = 16;
+const int auHeaderBytes = 2;
+const int auHeadersLengthPrefixBytes = 2;
+const int maxAuSize = (1 << 13) - 1;
 
-const int AU_HEADER_BITS = 16;
-const int AU_HEADER_BYTES = 2;
-const int AU_HEADERS_LENGTH_PREFIX_BYTES = 2;
+// ═══════════════════════════════════════════════════════════════════
+// Typed Output Frame
+// ═══════════════════════════════════════════════════════════════════
 
-const int MAX_AU_SIZE = (1 << 13) - 1;
+class AacFrame {
+  final Uint8List data;
+  final int timestampUs;
 
-const int DEFAULT_CLOCK_RATE = 48000;
+  const AacFrame({required this.data, required this.timestampUs});
+}
 
-// =============================
-// PACKETIZER
-// =============================
+// ═══════════════════════════════════════════════════════════════════
+// Typed Config
+// ═══════════════════════════════════════════════════════════════════
+
+class AacPacketizerConfig {
+  final RtpPacketizerConfig rtpConfig;
+  final int clockRate;
+
+  const AacPacketizerConfig({
+    required this.rtpConfig,
+    this.clockRate = aacClockRate,
+  });
+}
+
+class AacDepacketizerConfig {
+  final RtpDepacketizerCallbacks<AacFrame> callbacks;
+  final int constantDuration;
+
+  const AacDepacketizerConfig({
+    required this.callbacks,
+    this.constantDuration = 1024,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Packetizer
+// ═══════════════════════════════════════════════════════════════════
 
 class AacPacketizer {
   final RtpState state;
-  final int mtu;
   final int clockRate;
 
-  AacPacketizer(Map<String, dynamic> opts)
-    : state = createRtpState(opts),
-      mtu = opts['mtu'] ?? 1400,
-      clockRate = opts['clockRate'] ?? DEFAULT_CLOCK_RATE;
+  AacPacketizer(AacPacketizerConfig config)
+    : state = RtpState.fromConfig(config.rtpConfig),
+      clockRate = config.clockRate;
 
-  List<Buffer> packetize(Map<String, dynamic> chunk) {
-    _validate(chunk);
-    return _packetize(chunk);
-  }
-
-  void close() {}
-
-  void _validate(Map chunk) {
-    if (chunk['data'] == null || chunk['timestamp'] == null) {
-      throw Exception("AAC: invalid chunk");
-    }
-  }
-
-  List<Buffer> _packetize(Map<String, dynamic> chunk) {
-    final data = _toBuffer(chunk['data']);
+  List<Buffer> packetize(MediaChunk chunk) {
+    final data = Buffer.from(
+      chunk.data.buffer,
+      chunk.data.offsetInBytes,
+      chunk.data.lengthInBytes,
+    );
 
     if (data.length == 0) return [];
 
-    final rtpTs = usToRtp(chunk['timestamp'], clockRate);
+    final rtpTs = usToRtp(chunk.timestampUs, clockRate);
 
-    final headerOverhead = AU_HEADERS_LENGTH_PREFIX_BYTES + AU_HEADER_BYTES;
+    final headerOverhead = auHeadersLengthPrefixBytes + auHeaderBytes;
 
-    final maxFragSize = mtu - headerOverhead;
+    final maxFragSize = state.mtu - headerOverhead;
 
-    // ✅ SINGLE PACKET
     if (data.length <= maxFragSize) {
       return [_buildSinglePacket(data, rtpTs, true)];
     }
 
-    // ✅ FRAGMENTATION
     final out = <Buffer>[];
 
     int offset = 0;
@@ -70,7 +85,6 @@ class AacPacketizer {
 
       final u8 = data.subarray(offset, offset + size);
 
-      // ✅ FIX: convert slice → Buffer
       final frag = Buffer.from(u8.buffer, u8.offsetInBytes, u8.length);
 
       final isLast = (offset + size == total);
@@ -84,16 +98,17 @@ class AacPacketizer {
   }
 
   Buffer _buildSinglePacket(Buffer auData, int rtpTs, bool marker) {
-    final auSize = auData.length & MAX_AU_SIZE;
+    final auSize = auData.length & maxAuSize;
 
     final payload = Buffer.allocUnsafe(2 + 2 + auData.length);
 
-    payload.writeUInt16BE(AU_HEADER_BITS, 0);
+    // RFC 3640 §3.2.1: AU-headers-length in bits
+    payload.writeUInt16BE(auHeaderBits, 0);
     payload.writeUInt16BE((auSize << 3) & 0xFFFF, 2);
 
     auData.copy(payload, 4);
 
-    return makePacket(state, payload, rtpTs, marker, false);
+    return makeRtpPacket(state, payload, rtpTs, marker);
   }
 
   Buffer _buildFragmentPacket(
@@ -102,48 +117,43 @@ class AacPacketizer {
     int rtpTs,
     bool isLast,
   ) {
-    final auSize = totalAuSize & MAX_AU_SIZE;
+    final auSize = totalAuSize & maxAuSize;
 
     final payload = Buffer.allocUnsafe(2 + 2 + fragData.length);
 
-    payload.writeUInt16BE(AU_HEADER_BITS, 0);
+    payload.writeUInt16BE(auHeaderBits, 0);
     payload.writeUInt16BE((auSize << 3) & 0xFFFF, 2);
 
     fragData.copy(payload, 4);
 
-    // ✅ FIX: use isLast instead of marker
-    return makePacket(state, payload, rtpTs, isLast, false);
+    return makeRtpPacket(state, payload, rtpTs, isLast);
   }
 }
 
-// =============================
-// DEPACKETIZER
-// =============================
+// ═══════════════════════════════════════════════════════════════════
+// Depacketizer
+// ═══════════════════════════════════════════════════════════════════
 
 class AacDepacketizer {
-  void Function(Map<String, dynamic>)? _output;
-  void Function(Object)? _error;
-
-  int constantDuration;
+  final RtpDepacketizerCallbacks<AacFrame> _callbacks;
+  final int constantDuration;
 
   List<Uint8List>? _fragments;
   int _expectedSize = 0;
   int _fragmentTimestamp = 0;
   int _receivedSize = 0;
 
-  AacDepacketizer(Map<String, dynamic> opts)
-    : constantDuration = opts['constantDuration'] ?? 1024 {
-    _output = opts['output'];
-    _error = opts['error'];
-  }
+  AacDepacketizer(AacDepacketizerConfig config)
+    : _callbacks = config.callbacks,
+      constantDuration = config.constantDuration;
 
   static bool peekKeyframe() => false;
 
-  void depacketize(Map<String, dynamic> packet) {
-    final payload = packet['payload'] as Uint8List;
+  void depacketize(RtpPacket packet) {
+    final payload = packet.payload;
 
     if (payload.length < 2) {
-      _emitError("AAC payload too small");
+      _callbacks.onError?.call(Exception('AAC payload too small'));
       return;
     }
 
@@ -153,6 +163,7 @@ class AacDepacketizer {
       payload.length,
     );
 
+    // RFC 3640 §3.2.1: AU-headers-length is in bits
     final auHeadersBits = buf.readUInt16BE(0);
     final auHeadersBytes = (auHeadersBits + 7) >> 3;
 
@@ -160,16 +171,16 @@ class AacDepacketizer {
     final auHeadersEnd = auHeadersStart + auHeadersBytes;
 
     if (auHeadersEnd > buf.length) {
-      _emitError("AAC headers overflow");
+      _callbacks.onError?.call(Exception('AAC headers overflow'));
       return;
     }
 
-    if (auHeadersBits % AU_HEADER_BITS != 0) {
-      _emitError("AAC not hbr mode");
+    if (auHeadersBits % auHeaderBits != 0) {
+      _callbacks.onError?.call(Exception('AAC not hbr mode'));
       return;
     }
 
-    final numAUs = auHeadersBits ~/ AU_HEADER_BITS;
+    final numAUs = auHeadersBits ~/ auHeaderBits;
 
     final auDataStart = auHeadersEnd;
 
@@ -178,7 +189,7 @@ class AacDepacketizer {
     for (int i = 0; i < numAUs; i++) {
       final word = buf.readUInt16BE(auHeadersStart + i * 2);
 
-      headers.add({'size': (word >> 3) & MAX_AU_SIZE});
+      headers.add({'size': (word >> 3) & maxAuSize});
     }
 
     if (numAUs == 1) {
@@ -191,42 +202,51 @@ class AacDepacketizer {
           auDataStart,
           available,
           size,
-          packet['timestamp'],
-          packet['marker'],
+          packet.timestamp,
+          packet.marker,
         );
         return;
       }
 
       _reset();
 
-      _output?.call({
-        'data': payload.sublist(auDataStart, auDataStart + size),
-        'timestamp': packet['timestamp'],
-        'type': 'key',
-      });
+      try {
+        _callbacks.onFrame?.call(
+          AacFrame(
+            data: payload.sublist(auDataStart, auDataStart + size),
+            timestampUs: (packet.timestamp * 1000000) ~/ aacClockRate,
+          ),
+        );
+      } catch (e, st) {
+        _callbacks.onError?.call(e, st);
+      }
 
       return;
     }
 
-    // ✅ MULTI-AU
     _reset();
 
     int dataOffset = auDataStart;
-    int ts = packet['timestamp'];
+    int ts = packet.timestamp;
 
     for (final h in headers) {
       final size = h['size']!;
 
       if (dataOffset + size > buf.length) {
-        _emitError("AAC overflow");
+        _callbacks.onError?.call(Exception('AAC overflow'));
         return;
       }
 
-      _output?.call({
-        'data': payload.sublist(dataOffset, dataOffset + size),
-        'timestamp': ts,
-        'type': 'key',
-      });
+      try {
+        _callbacks.onFrame?.call(
+          AacFrame(
+            data: payload.sublist(dataOffset, dataOffset + size),
+            timestampUs: (ts * 1000000) ~/ aacClockRate,
+          ),
+        );
+      } catch (e, st) {
+        _callbacks.onError?.call(e, st);
+      }
 
       dataOffset += size;
       ts += constantDuration;
@@ -255,18 +275,23 @@ class AacDepacketizer {
 
     if (marker) {
       if (_receivedSize != _expectedSize) {
-        _emitError("AAC fragment mismatch");
+        _callbacks.onError?.call(Exception('AAC fragment mismatch'));
         _reset();
         return;
       }
 
       final out = _concat(_fragments!);
 
-      _output?.call({
-        'data': out,
-        'timestamp': _fragmentTimestamp,
-        'type': 'key',
-      });
+      try {
+        _callbacks.onFrame?.call(
+          AacFrame(
+            data: out,
+            timestampUs: (_fragmentTimestamp * 1000000) ~/ aacClockRate,
+          ),
+        );
+      } catch (e, st) {
+        _callbacks.onError?.call(e, st);
+      }
 
       _reset();
     }
@@ -274,7 +299,9 @@ class AacDepacketizer {
 
   Uint8List _concat(List<Uint8List> parts) {
     int total = 0;
-    for (final p in parts) total += p.length;
+    for (final p in parts) {
+      total += p.length;
+    }
 
     final out = Uint8List(total);
     int offset = 0;
@@ -293,30 +320,4 @@ class AacDepacketizer {
     _receivedSize = 0;
     _fragmentTimestamp = 0;
   }
-
-  void _emitError(Object err) {
-    _error?.call(err);
-  }
-
-  void reset() => _reset();
-
-  void close() {
-    _reset();
-    _output = null;
-    _error = null;
-  }
-}
-
-// =============================
-// HELPERS
-// =============================
-
-Buffer _toBuffer(dynamic d) {
-  if (d is Buffer) return d;
-
-  if (d is Uint8List) {
-    return Buffer.from(d.buffer, d.offsetInBytes, d.length);
-  }
-
-  throw Exception("Invalid AAC buffer");
 }

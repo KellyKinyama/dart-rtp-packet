@@ -121,6 +121,57 @@ int usToRtp(int us, int clockRate) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Typed Configuration
+// ═══════════════════════════════════════════════════════════════════
+
+/// RFC 3550 compliant RTP packetizer configuration.
+class RtpPacketizerConfig {
+  final int ssrc;
+  final int payloadType;
+  final int mtu;
+  final int? initialSequenceNumber;
+
+  const RtpPacketizerConfig({
+    required this.ssrc,
+    required this.payloadType,
+    this.mtu = DEFAULT_MTU,
+    this.initialSequenceNumber,
+  });
+
+  /// Validate and return sanitized config.
+  RtpPacketizerConfig validate() {
+    if (payloadType < 0 || payloadType > 127) {
+      throw ArgumentError('payloadType must be 0–127 (RFC 3551)');
+    }
+    if (mtu < 100 || mtu > 65535) {
+      throw ArgumentError('mtu must be 100–65535');
+    }
+    return RtpPacketizerConfig(
+      ssrc: ssrc & 0xFFFFFFFF,
+      payloadType: payloadType & 0x7F,
+      mtu: mtu,
+      initialSequenceNumber: initialSequenceNumber,
+    );
+  }
+}
+
+/// Typed media chunk for all packetizers (replaces map-based chunk).
+class MediaChunk {
+  final Uint8List data;
+  final int timestampUs;
+
+  const MediaChunk({required this.data, required this.timestampUs});
+}
+
+/// Generic depacketizer callbacks (codecs parameterize T with their frame type).
+class RtpDepacketizerCallbacks<T> {
+  final void Function(T frame)? onFrame;
+  final void Function(Object error, [StackTrace? st])? onError;
+
+  const RtpDepacketizerCallbacks({this.onFrame, this.onError});
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // RTP STATE
 // ═══════════════════════════════════════════════════════════════════
 
@@ -130,40 +181,41 @@ class RtpState {
   int mtu;
   int seq;
 
-  RtpState({
+  RtpState._({
     required this.ssrc,
     required this.payloadType,
-    this.mtu = DEFAULT_MTU,
-    int? initialSequence,
-  }) : seq =
-           initialSequence ?? (DateTime.now().millisecondsSinceEpoch & 0xFFFF) {
-    if (payloadType < 0 || payloadType > 127) {
-      throw ArgumentError('payloadType must be 0–127');
-    }
-  }
-}
+    required this.mtu,
+    required this.seq,
+  });
 
-RtpState createRtpState(Map<String, dynamic> opts) {
-  if (!opts.containsKey('ssrc')) {
-    throw ArgumentError('ssrc required');
-  }
-
-  if (!opts.containsKey('payloadType')) {
-    throw ArgumentError('payloadType required');
-  }
-
-  final mtu = opts['mtu'] ?? DEFAULT_MTU;
-
-  if (mtu < 100 || mtu > 65535) {
-    throw ArgumentError('mtu must be between 100–65535');
+  /// Factory from typed config (RFC 3550 §5.1 initial sequence).
+  factory RtpState.fromConfig(RtpPacketizerConfig config) {
+    final validated = config.validate();
+    final initialSeq =
+        validated.initialSequenceNumber ??
+        (DateTime.now().millisecondsSinceEpoch & 0xFFFF);
+    return RtpState._(
+      ssrc: validated.ssrc,
+      payloadType: validated.payloadType,
+      mtu: validated.mtu,
+      seq: initialSeq & 0xFFFF,
+    );
   }
 
-  return RtpState(
-    ssrc: opts['ssrc'] & 0xFFFFFFFF,
-    payloadType: opts['payloadType'] & 0x7F,
-    mtu: mtu,
-    initialSequence: opts['initialSequenceNumber'],
-  );
+  /// Legacy map-based constructor (deprecated, use fromConfig).
+  @Deprecated('Use RtpState.fromConfig(RtpPacketizerConfig) instead')
+  factory RtpState.fromMap(Map<String, dynamic> opts) {
+    return RtpState.fromConfig(
+      RtpPacketizerConfig(
+        ssrc: opts['ssrc'] ?? (throw ArgumentError('ssrc required')),
+        payloadType:
+            opts['payloadType'] ??
+            (throw ArgumentError('payloadType required')),
+        mtu: opts['mtu'] ?? DEFAULT_MTU,
+        initialSequenceNumber: opts['initialSequenceNumber'],
+      ),
+    );
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -184,13 +236,12 @@ class BufferMeta {
   });
 }
 
-// ✅ FIXED: dynamic return (no more type error)
-dynamic makePacket(
+/// Build RTP packet (RFC 3550 §5.1). Returns buffer only.
+Buffer makeRtpPacket(
   RtpState state,
   Buffer? payload,
   int rtpTimestamp,
   bool marker,
-  bool withMeta,
 ) {
   final seq = state.seq;
   final payloadLen = payload?.length ?? 0;
@@ -219,7 +270,40 @@ dynamic makePacket(
 
   state.seq = (state.seq + 1) & 0xFFFF;
 
+  return buf;
+}
+
+/// Build RTP packet with metadata. Returns BufferMeta.
+BufferMeta makeRtpPacketWithMeta(
+  RtpState state,
+  Buffer? payload,
+  int rtpTimestamp,
+  bool marker,
+) {
+  final seq = state.seq;
+  final buf = makeRtpPacket(state, payload, rtpTimestamp, marker);
+
+  return BufferMeta(
+    buffer: buf,
+    sequenceNumber: seq,
+    timestamp: rtpTimestamp,
+    marker: marker,
+  );
+}
+
+/// Legacy dual-mode function (deprecated, use makeRtpPacket or makeRtpPacketWithMeta).
+@Deprecated('Use makeRtpPacket or makeRtpPacketWithMeta')
+dynamic makePacket(
+  RtpState state,
+  Buffer? payload,
+  int rtpTimestamp,
+  bool marker,
+  bool withMeta,
+) {
   if (withMeta) {
+    // Re-capture seq before increment
+    final seq = state.seq;
+    final buf = makeRtpPacket(state, payload, rtpTimestamp, marker);
     return BufferMeta(
       buffer: buf,
       sequenceNumber: seq,
@@ -227,8 +311,7 @@ dynamic makePacket(
       marker: marker,
     );
   }
-
-  return buf;
+  return makeRtpPacket(state, payload, rtpTimestamp, marker);
 }
 
 class RtpPacket {

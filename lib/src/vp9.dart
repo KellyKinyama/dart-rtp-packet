@@ -1,28 +1,60 @@
 import 'dart:typed_data';
 import 'rtp.dart';
 
-const int VP9_CLOCK_RATE = 90000;
+const int vp9ClockRate = 90000;
+
+// ═══════════════════════════════════════════════════════════════════
+// Typed Output Frame
+// ═══════════════════════════════════════════════════════════════════
+
+class Vp9Frame {
+  final Uint8List data;
+  final int timestampUs;
+  final bool keyFrame;
+
+  const Vp9Frame({
+    required this.data,
+    required this.timestampUs,
+    required this.keyFrame,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Packetizer
+// ═══════════════════════════════════════════════════════════════════
+
+bool _isVp9Keyframe(Uint8List data) {
+  if (data.isEmpty) return false;
+  // RFC: P=1 means inter-frame (non-key), P=0 means key frame.
+  // VP9 bitstream: frame_type bit (0=key, 1=non-key) is at bit 5 of first byte.
+  // Assume frame_marker=2, profile=0, show_existing_frame=0.
+  return ((data[0] >> 5) & 1) == 0;
+}
 
 class VP9Packetizer {
   final RtpState state;
 
-  VP9Packetizer(Map<String, dynamic> opts) : state = createRtpState(opts);
+  VP9Packetizer(RtpPacketizerConfig config)
+    : state = RtpState.fromConfig(config);
 
-  List<Buffer> packetize(Map<String, dynamic> chunk) {
-    final data = toBuffer(chunk['data'])!;
-    final rtpTs = usToRtp(chunk['timestamp'], VP9_CLOCK_RATE);
+  List<Buffer> packetize(MediaChunk chunk) {
+    final data = Buffer.from(
+      chunk.data.buffer,
+      chunk.data.offsetInBytes,
+      chunk.data.lengthInBytes,
+    );
+    final rtpTs = usToRtp(chunk.timestampUs, vp9ClockRate);
 
     final maxPayload = state.mtu - 1;
 
-    // ✅ P bit (key vs delta)
-    final P = (chunk['type'] == 'delta') ? 0x40 : 0;
+    final isKey = _isVp9Keyframe(chunk.data);
+    final P = isKey ? 0 : 0x40;
 
-    // ✅ SINGLE PACKET
     if (data.length <= maxPayload) {
       return [
         makePacketWithPrefix(
           state,
-          P | 0x08 | 0x04, // P + B + E
+          P | 0x08 | 0x04,
           0,
           0,
           0,
@@ -36,7 +68,6 @@ class VP9Packetizer {
       ];
     }
 
-    // ✅ FRAGMENTED
     final List<Buffer> out = [];
     int offset = 0;
     int fragIndex = 0;
@@ -76,24 +107,28 @@ class VP9Packetizer {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Depacketizer
+// ═══════════════════════════════════════════════════════════════════
+
 class VP9Depacketizer {
-  void Function(Map<String, dynamic>)? _output;
-  void Function(Object)? _error;
+  final RtpDepacketizerCallbacks<Vp9Frame> _callbacks;
 
   List<Uint8List> _fragments = [];
+  int _lastTimestamp = 0;
 
-  VP9Depacketizer(Map<String, dynamic> opts) {
-    _output = opts['output'];
-    _error = opts['error'];
-  }
+  VP9Depacketizer(RtpDepacketizerCallbacks<Vp9Frame> callbacks)
+    : _callbacks = callbacks;
 
-  void depacketize(Map<String, dynamic> packet) {
-    final payload = packet['payload'] as Uint8List;
+  void depacketize(RtpPacket packet) {
+    final payload = packet.payload;
 
     if (payload.isEmpty) {
-      _emitError(Exception("VP9Depacketizer: empty payload"));
+      _callbacks.onError?.call(Exception('VP9: empty payload'));
       return;
     }
+
+    _lastTimestamp = packet.timestamp;
 
     final desc = payload[0];
     final B = (desc & 0x08) != 0;
@@ -102,7 +137,7 @@ class VP9Depacketizer {
     int hdrLen = 1;
 
     if (hdrLen >= payload.length) {
-      _emitError(Exception("VP9Depacketizer: invalid header"));
+      _callbacks.onError?.call(Exception('VP9: invalid header'));
       return;
     }
 
@@ -114,13 +149,12 @@ class VP9Depacketizer {
       _fragments.add(data);
     }
 
-    if (E || packet['marker'] == true) {
+    if (E || packet.marker) {
       if (_fragments.isEmpty) return;
 
       final frame = _concat(_fragments);
       _fragments = [];
 
-      // ✅ simple keyframe detection
       bool isKey = false;
       if (frame.isNotEmpty) {
         final fm = (frame[0] >> 6) & 3;
@@ -129,11 +163,17 @@ class VP9Depacketizer {
         }
       }
 
-      _output?.call({
-        'data': frame,
-        'timestamp': packet['timestamp'],
-        'type': isKey ? 'key' : 'delta',
-      });
+      try {
+        _callbacks.onFrame?.call(
+          Vp9Frame(
+            data: frame,
+            timestampUs: (_lastTimestamp * 1000000) ~/ vp9ClockRate,
+            keyFrame: isKey,
+          ),
+        );
+      } catch (e, st) {
+        _callbacks.onError?.call(e, st);
+      }
     }
   }
 
@@ -147,9 +187,5 @@ class VP9Depacketizer {
       offset += p.length;
     }
     return out;
-  }
-
-  void _emitError(Object err) {
-    _error?.call(err);
   }
 }

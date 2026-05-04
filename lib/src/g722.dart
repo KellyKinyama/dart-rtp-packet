@@ -1,8 +1,19 @@
 import 'dart:typed_data';
 import 'rtp.dart';
 
-// ✅ Correct constant typing
-const int G722_CLOCK_RATE = 8000;
+// RFC 3551 §4.5.2: G.722 uses 8000 Hz RTP clock (NOT 16000 Hz audio sample rate)
+const int g722ClockRate = 8000;
+
+// ═══════════════════════════════════════════════════════════════════
+// Typed Output Frame
+// ═══════════════════════════════════════════════════════════════════
+
+class G722Frame {
+  final Uint8List data;
+  final int timestampUs;
+
+  const G722Frame({required this.data, required this.timestampUs});
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // Packetizer
@@ -11,40 +22,25 @@ const int G722_CLOCK_RATE = 8000;
 class G722Packetizer {
   final RtpState state;
 
-  G722Packetizer(Map<String, dynamic> opts) : state = createRtpState(opts);
+  G722Packetizer(RtpPacketizerConfig config)
+    : state = RtpState.fromConfig(config);
 
-  /// Standard packetization
-  List<Buffer> packetize(Map<String, dynamic> chunk) {
-    _validateChunk(chunk);
-    return _packetize(chunk, false).cast<Buffer>();
-  }
+  List<Buffer> packetize(MediaChunk chunk, {bool marker = false}) {
+    final data = Buffer.from(
+      chunk.data.buffer,
+      chunk.data.offsetInBytes,
+      chunk.data.lengthInBytes,
+    );
+    // RFC 3551 §4.5.2: RTP timestamp clock is 8000 Hz, not 16000 Hz
+    final rtpTs = usToRtp(chunk.timestampUs, g722ClockRate);
 
-  /// Packetize with metadata
-  List<dynamic> packetizeWithMeta(Map<String, dynamic> chunk) {
-    _validateChunk(chunk);
-    return _packetize(chunk, true);
-  }
-
-  void close() {}
-
-  List<dynamic> _packetize(Map<String, dynamic> chunk, bool withMeta) {
-    final data = toBuffer(chunk['data'])!;
-    final rtpTs = usToRtp(chunk['timestamp'], G722_CLOCK_RATE);
-    final marker = chunk['marker'] == true;
-
-    // ✅ Fast path (common case)
     if (data.length <= state.mtu) {
-      return [makePacket(state, data, rtpTs, marker, withMeta)];
+      return [makeRtpPacket(state, data, rtpTs, marker)];
     }
 
-    // ✅ Warn for abnormal case (large frame)
-    print(
-      'G722Packetizer warning: block ${data.length} > MTU ${state.mtu}, splitting',
-    );
-
-    final List<dynamic> out = [];
+    // When fragmenting, all fragments share the same timestamp
+    final List<Buffer> out = [];
     int offset = 0;
-    int fragIndex = 0;
 
     while (offset < data.length) {
       final size = (data.length - offset > state.mtu)
@@ -52,39 +48,21 @@ class G722Packetizer {
           : data.length - offset;
 
       final slice = data.subarray(offset, offset + size);
-      final fragTs = (rtpTs + offset) & 0xFFFFFFFF;
+      final isFirst = (offset == 0);
 
       out.add(
-        makePacket(
+        makeRtpPacket(
           state,
           Buffer.from(slice.buffer, slice.offsetInBytes, slice.length),
-          fragTs,
-          marker && fragIndex == 0,
-          withMeta,
+          rtpTs, // same timestamp for all fragments
+          isFirst && marker,
         ),
       );
 
       offset += size;
-      fragIndex++;
     }
 
     return out;
-  }
-
-  // ✅ Local validation (better than global validateChunk)
-  void _validateChunk(Map<String, dynamic> chunk) {
-    if (chunk['timestamp'] == null) {
-      throw ArgumentError('chunk.timestamp is required');
-    }
-
-    if (chunk['data'] == null) {
-      throw ArgumentError('chunk.data is required');
-    }
-
-    final data = chunk['data'];
-    if (data is! Buffer && data is! Uint8List) {
-      throw ArgumentError('chunk.data must be Buffer or Uint8List');
-    }
   }
 }
 
@@ -93,50 +71,29 @@ class G722Packetizer {
 // ═══════════════════════════════════════════════════════════════════
 
 class G722Depacketizer {
-  void Function(Map<String, dynamic>)? _output;
-  void Function(Object)? _error;
+  final RtpDepacketizerCallbacks<G722Frame> _callbacks;
 
-  G722Depacketizer(Map<String, dynamic> opts) {
-    if (opts['output'] == null || opts['output'] is! Function) {
-      throw ArgumentError('G722Depacketizer: output callback is required');
-    }
-
-    _output = opts['output'];
-    _error = (opts['error'] is Function) ? opts['error'] : null;
-  }
+  G722Depacketizer(RtpDepacketizerCallbacks<G722Frame> callbacks)
+    : _callbacks = callbacks;
 
   static bool peekKeyframe() => false;
 
-  void depacketize(Map<String, dynamic>? packet) {
-    if (packet == null ||
-        packet['payload'] == null ||
-        (packet['payload'] as Uint8List).isEmpty) {
-      _emitError(Exception('G722Depacketizer: empty or missing payload'));
+  void depacketize(RtpPacket packet) {
+    if (packet.payload.isEmpty) {
+      _callbacks.onError?.call(Exception('G.722: empty payload'));
       return;
     }
 
-    _output?.call({
-      'data': packet['payload'],
-      'timestamp': packet['timestamp'],
-      'type': 'key',
-      'marker': packet['marker'] == true,
-    });
-  }
-
-  void _emitError(Object err) {
-    if (_error == null) return;
-
     try {
-      _error!(err);
-    } catch (e) {
-      print('G722Depacketizer error callback threw: $e');
+      _callbacks.onFrame?.call(
+        G722Frame(
+          data: packet.payload,
+          // RFC 3551 §4.5.2: RTP clock 8000 Hz
+          timestampUs: (packet.timestamp * 1000000) ~/ g722ClockRate,
+        ),
+      );
+    } catch (e, st) {
+      _callbacks.onError?.call(e, st);
     }
-  }
-
-  void reset() {}
-
-  void close() {
-    _output = null;
-    _error = null;
   }
 }

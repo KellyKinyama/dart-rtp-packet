@@ -1,8 +1,9 @@
 import 'dart:typed_data';
 
 import '../../src/g711.dart';
+import '../../src/rtp.dart';
 
-class G711Codec {
+class G711Encoder {
   // μ-law encode (simple lookup version)
   static int linearToUlaw(int sample) {
     const int BIAS = 0x84;
@@ -41,19 +42,18 @@ class G711Codec {
 }
 
 void main() {
-  final pkt = G711Packetizer({'ssrc': 1234, 'payloadType': 0});
+  final pkt = G711Packetizer(RtpPacketizerConfig(ssrc: 1234, payloadType: 0));
 
   // ✅ fake PCM16 (320 bytes = 160 samples)
   final pcm = Uint8List.fromList(List.filled(320, 0x00));
 
   // ✅ encode → G.711
-  final g711 = G711Codec.encodePCM16(pcm);
+  final g711 = G711Encoder.encodePCM16(pcm);
 
-  final packets = pkt.packetize({
-    'data': g711,
-    'timestamp': 1000000,
-    'marker': true,
-  });
+  final packets = pkt.packetize(
+    MediaChunk(data: g711, timestampUs: 1000000),
+    marker: true,
+  );
 
   print("G711 bytes: ${g711.length}");
   print("Generated packets: ${packets.length}");

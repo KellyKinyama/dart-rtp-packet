@@ -17,13 +17,12 @@ class DtmfSender {
     required this.port,
   });
 
-  // ✅ Main API
   Future<void> sendDigit(
     String digit, {
     int durationMs = 200,
     int packetIntervalMs = 20,
   }) async {
-    final samplesPerPacket = (packetizer.clockRate * packetIntervalMs ~/ 1000);
+    final samplesPerPacket = dtmfClockRate * packetIntervalMs ~/ 1000;
 
     int durationSamples = 0;
 
@@ -33,13 +32,15 @@ class DtmfSender {
     for (int i = 0; i < totalPackets; i++) {
       durationSamples += samplesPerPacket;
 
-      final packets = packetizer.packetize({
-        'event': digit,
-        'timestamp': _timestamp,
-        'durationSamples': durationSamples,
-        'marker': i == 0, // ✅ start only
-        'end': false,
-      });
+      final packets = packetizer.packetize(
+        DtmfChunk(
+          timestampUs: _timestamp,
+          event: DtmfDigit.fromString(digit)?.code ?? 0,
+          durationSamples: durationSamples,
+          marker: i == 0, // RFC 4733: marker on first packet
+          end: false,
+        ),
+      );
 
       for (final p in packets) {
         socket.send(p.subarray(0), ip, port);
@@ -50,12 +51,14 @@ class DtmfSender {
 
     // ✅ SEND END (3x REQUIRED)
     for (int i = 0; i < 3; i++) {
-      final packets = packetizer.packetize({
-        'event': digit,
-        'timestamp': _timestamp,
-        'durationSamples': durationSamples,
-        'end': true,
-      });
+      final packets = packetizer.packetize(
+        DtmfChunk(
+          timestampUs: _timestamp,
+          event: DtmfDigit.fromString(digit)?.code ?? 0,
+          durationSamples: durationSamples,
+          end: true,
+        ),
+      );
 
       for (final p in packets) {
         socket.send(p.subarray(0), ip, port);
@@ -79,33 +82,30 @@ void main() async {
   await receiverSocket.bind(5002);
 
   // ✅ Packetizer
-  final dtmfSender = DTMFPacketizer({
-    'ssrc': 5555,
-    'payloadType': 101, // typical DTMF PT
-  });
+  final dtmfSender = DTMFPacketizer(
+    RtpPacketizerConfig(ssrc: 5555, payloadType: 101),
+  );
 
   // ✅ Depacketizer
-  final dtmfReceiver = DTMFDepacketizer({
-    'output': (chunk) {
-      print(
-        "DTMF RECEIVED → symbol=${chunk['symbol']} "
-        "event=${chunk['event']} "
-        "end=${chunk['end']} "
-        "duration=${chunk['durationSamples']}",
-      );
-    },
-  });
+  final dtmfReceiver = DTMFDepacketizer(
+    RtpDepacketizerCallbacks<DtmfEvent>(
+      onFrame: (evt) {
+        print(
+          "DTMF RECEIVED → symbol=${evt.symbol} "
+          "event=${evt.event} "
+          "end=${evt.end} "
+          "duration=${evt.durationSamples}",
+        );
+      },
+    ),
+  );
 
   // ✅ Receiver pipeline
   receiverSocket.listen((data) {
     final pkt = parseRtp(Buffer.from(data.buffer, 0, data.length));
 
     if (pkt != null) {
-      dtmfReceiver.depacketize({
-        'payload': pkt.payload,
-        'timestamp': pkt.timestamp,
-        'marker': pkt.marker,
-      });
+      dtmfReceiver.depacketize(pkt);
     }
   });
 
@@ -122,13 +122,15 @@ void main() async {
   for (int i = 0; i < 4; i++) {
     duration += 160; // ~20ms at 8kHz
 
-    final packets = dtmfSender.packetize({
-      'event': '5',
-      'timestamp': timestamp,
-      'durationSamples': duration,
-      'marker': (i == 0), // ONLY first packet
-      'end': false,
-    });
+    final packets = dtmfSender.packetize(
+      DtmfChunk(
+        timestampUs: timestamp,
+        event: DtmfDigit.fromString('5')?.code ?? 5,
+        durationSamples: duration,
+        marker: i == 0, // ONLY first packet
+        end: false,
+      ),
+    );
 
     for (final p in packets) {
       senderSocket.send(p.subarray(0), ip, port);
@@ -139,12 +141,14 @@ void main() async {
 
   // ✅ END packets (send 3 times)
   for (int i = 0; i < 3; i++) {
-    final packets = dtmfSender.packetize({
-      'event': '5',
-      'timestamp': timestamp,
-      'durationSamples': duration,
-      'end': true,
-    });
+    final packets = dtmfSender.packetize(
+      DtmfChunk(
+        timestampUs: timestamp,
+        event: DtmfDigit.fromString('5')?.code ?? 5,
+        durationSamples: duration,
+        end: true,
+      ),
+    );
 
     for (final p in packets) {
       senderSocket.send(p.subarray(0), ip, port);

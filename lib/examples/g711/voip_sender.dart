@@ -2,7 +2,7 @@ import 'dart:typed_data';
 
 import '../../src/g711.dart';
 import '../../src/rtp.dart';
-import 'g711.dart'; // contains G711Codec
+import 'g711.dart' as codec;
 import '../rtp_socket.dart';
 
 class VoipSender {
@@ -16,23 +16,20 @@ class VoipSender {
     required this.socket,
     required this.remoteIp,
     required this.remotePort,
-  }) : packetizer = G711Packetizer({
-         'ssrc': 1234,
-         'payloadType': 0, // PCMU
-       });
+  }) : packetizer = G711Packetizer(
+         RtpPacketizerConfig(ssrc: 1234, payloadType: 0),
+       );
 
   int timestamp = 0;
 
   void sendPcm(Uint8List pcmChunk) {
     // ✅ 1. Encode PCM → G.711
-    final g711 = G711Codec.encodePCM16(pcmChunk);
+    final g711 = codec.G711Encoder.encodePCM16(pcmChunk);
 
     // ✅ 2. Packetize
-    final packets = packetizer.packetize({
-      'data': g711,
-      'timestamp': timestamp,
-      'marker': false,
-    });
+    final packets = packetizer.packetize(
+      MediaChunk(data: g711, timestampUs: timestamp),
+    );
 
     // ✅ 3. Send RTP packets
     for (final p in packets) {

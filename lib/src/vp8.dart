@@ -1,25 +1,49 @@
 import 'dart:typed_data';
 import 'rtp.dart';
 
-const int VP8_CLOCK_RATE = 90000;
+const int vp8ClockRate = 90000;
+
+// ═══════════════════════════════════════════════════════════════════
+// Typed Output Frame
+// ═══════════════════════════════════════════════════════════════════
+
+class Vp8Frame {
+  final Uint8List data;
+  final int timestampUs;
+  final bool keyFrame;
+
+  const Vp8Frame({
+    required this.data,
+    required this.timestampUs,
+    required this.keyFrame,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Packetizer
+// ═══════════════════════════════════════════════════════════════════
 
 class VP8Packetizer {
   final RtpState state;
 
-  VP8Packetizer(Map<String, dynamic> opts) : state = createRtpState(opts);
+  VP8Packetizer(RtpPacketizerConfig config)
+    : state = RtpState.fromConfig(config);
 
-  List<Buffer> packetize(Map<String, dynamic> chunk) {
-    final data = toBuffer(chunk['data'])!;
-    final rtpTs = usToRtp(chunk['timestamp'], VP8_CLOCK_RATE);
+  List<Buffer> packetize(MediaChunk chunk) {
+    final data = Buffer.from(
+      chunk.data.buffer,
+      chunk.data.offsetInBytes,
+      chunk.data.lengthInBytes,
+    );
+    final rtpTs = usToRtp(chunk.timestampUs, vp8ClockRate);
 
-    final maxPayload = state.mtu - 1; // minus 1-byte VP8 header
+    final maxPayload = state.mtu - 1;
 
-    // ✅ SINGLE PACKET
     if (data.length <= maxPayload) {
       return [
         makePacketWithPrefix(
           state,
-          0x10, // S bit = start of partition
+          0x10,
           0,
           0,
           0,
@@ -28,12 +52,11 @@ class VP8Packetizer {
           0,
           data.length,
           rtpTs,
-          true, // marker → end of frame
+          true,
         ),
       ];
     }
 
-    // ✅ FRAGMENTED
     final List<Buffer> out = [];
 
     int offset = 0;
@@ -70,31 +93,34 @@ class VP8Packetizer {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Depacketizer
+// ═══════════════════════════════════════════════════════════════════
+
 class VP8Depacketizer {
-  void Function(Map<String, dynamic>)? _output;
-  void Function(Object)? _error;
+  final RtpDepacketizerCallbacks<Vp8Frame> _callbacks;
 
   List<Uint8List> _fragments = [];
+  int _lastTimestamp = 0;
 
-  VP8Depacketizer(Map<String, dynamic> opts) {
-    _output = opts['output'];
-    _error = opts['error'];
-  }
+  VP8Depacketizer(RtpDepacketizerCallbacks<Vp8Frame> callbacks)
+    : _callbacks = callbacks;
 
-  void depacketize(Map<String, dynamic> packet) {
-    final payload = packet['payload'] as Uint8List;
+  void depacketize(RtpPacket packet) {
+    final payload = packet.payload;
 
     if (payload.isEmpty) {
-      _emitError(Exception("VP8Depacketizer: empty payload"));
+      _callbacks.onError?.call(Exception('VP8: empty payload'));
       return;
     }
+
+    _lastTimestamp = packet.timestamp;
 
     final S = (payload[0] & 0x10) != 0;
     final X = (payload[0] & 0x80) != 0;
 
     int hdrLen = 1;
 
-    // ✅ handle extended header
     if (X && payload.length > 1) {
       final ext = payload[1];
       hdrLen = 2;
@@ -109,7 +135,7 @@ class VP8Depacketizer {
     }
 
     if (hdrLen >= payload.length) {
-      _emitError(Exception("VP8Depacketizer: invalid header"));
+      _callbacks.onError?.call(Exception('VP8: invalid header'));
       return;
     }
 
@@ -121,19 +147,24 @@ class VP8Depacketizer {
       _fragments.add(data);
     }
 
-    // ✅ FRAME COMPLETE
-    if (packet['marker'] == true && _fragments.isNotEmpty) {
+    if (packet.marker && _fragments.isNotEmpty) {
       final frame = _concat(_fragments);
-
-      _fragments = [];
 
       final isKey = (frame[0] & 0x01) == 0;
 
-      _output?.call({
-        'data': frame,
-        'timestamp': packet['timestamp'],
-        'type': isKey ? 'key' : 'delta',
-      });
+      try {
+        _callbacks.onFrame?.call(
+          Vp8Frame(
+            data: frame,
+            timestampUs: (_lastTimestamp * 1000000) ~/ vp8ClockRate,
+            keyFrame: isKey,
+          ),
+        );
+      } catch (e, st) {
+        _callbacks.onError?.call(e, st);
+      }
+
+      _fragments = [];
     }
   }
 
@@ -148,9 +179,5 @@ class VP8Depacketizer {
     }
 
     return out;
-  }
-
-  void _emitError(Object err) {
-    _error?.call(err);
   }
 }

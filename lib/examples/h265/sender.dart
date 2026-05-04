@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import '../../src/h265.dart';
+import '../../src/rtp.dart';
 import '../rtp_socket.dart';
 
 class VoipSenderH265 {
@@ -12,20 +13,15 @@ class VoipSenderH265 {
 
   int timestamp = 0;
 
-  VoipSenderH265({
-    required this.socket,
-    required this.ip,
-    required this.port,
-  }) : packetizer = H265Packetizer({
-          'ssrc': 1111,
-          'payloadType': 96,
-        });
+  VoipSenderH265({required this.socket, required this.ip, required this.port})
+    : packetizer = H265Packetizer(
+        RtpPacketizerConfig(ssrc: 1111, payloadType: 96),
+      );
 
   Future<void> sendFrame(Uint8List frame) async {
-    final packets = packetizer.packetize({
-      'data': frame,
-      'timestamp': timestamp,
-    });
+    final packets = packetizer.packetize(
+      MediaChunk(data: frame, timestampUs: timestamp),
+    );
 
     for (final p in packets) {
       socket.send(p.subarray(0), ip, port);

@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import '../../src/vp8.dart';
+import '../../src/rtp.dart';
 import '../rtp_socket.dart';
 
 class VoipSenderVP8 {
@@ -13,13 +14,14 @@ class VoipSenderVP8 {
   int timestamp = 0;
 
   VoipSenderVP8({required this.socket, required this.ip, required this.port})
-    : packetizer = VP8Packetizer({'ssrc': 8888, 'payloadType': 96});
+    : packetizer = VP8Packetizer(
+        RtpPacketizerConfig(ssrc: 8888, payloadType: 96),
+      );
 
   Future<void> sendFrame(Uint8List frame) async {
-    final packets = packetizer.packetize({
-      'data': frame,
-      'timestamp': timestamp,
-    });
+    final packets = packetizer.packetize(
+      MediaChunk(data: frame, timestampUs: timestamp),
+    );
 
     for (final p in packets) {
       socket.send(p.subarray(0), ip, port);

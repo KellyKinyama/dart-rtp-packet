@@ -7,22 +7,20 @@ class VoipReceiverVP9 {
   final VP9Depacketizer depacketizer;
 
   VoipReceiverVP9(this.socket)
-    : depacketizer = VP9Depacketizer({
-        'output': (Map frame) {
-          print("VP9 frame: ${frame['data'].length}");
-        },
-      });
+    : depacketizer = VP9Depacketizer(
+        RtpDepacketizerCallbacks<Vp9Frame>(
+          onFrame: (frame) {
+            print('VP9 frame: ${frame.data.length} bytes');
+          },
+        ),
+      );
 
   void start() {
     socket.listen((data) {
       final pkt = parseRtp(Buffer.from(data.buffer, 0, data.length));
 
       if (pkt != null) {
-        depacketizer.depacketize({
-          'payload': pkt.payload,
-          'timestamp': pkt.timestamp,
-          'marker': pkt.marker,
-        });
+        depacketizer.depacketize(pkt);
       }
     });
   }

@@ -7,22 +7,20 @@ class VoipReceiverH265 {
   final H265Depacketizer depacketizer;
 
   VoipReceiverH265(this.socket)
-    : depacketizer = H265Depacketizer({
-        'output': (Map frame) {
-          print("H265 frame: ${frame['data'].length}");
-        },
-      });
+    : depacketizer = H265Depacketizer(
+        RtpDepacketizerCallbacks<H265Frame>(
+          onFrame: (frame) {
+            print('H265 frame: ${frame.annexB.length} bytes');
+          },
+        ),
+      );
 
   void start() {
     socket.listen((data) {
       final pkt = parseRtp(Buffer.from(data.buffer, 0, data.length));
 
       if (pkt != null) {
-        depacketizer.depacketize({
-          'payload': pkt.payload,
-          'timestamp': pkt.timestamp,
-          'marker': pkt.marker,
-        });
+        depacketizer.depacketize(pkt);
       }
     });
   }

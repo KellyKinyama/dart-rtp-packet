@@ -1,8 +1,8 @@
 import 'dart:typed_data';
 
 import '../../src/g722.dart';
+import '../../src/rtp.dart';
 import '../rtp_socket.dart';
-// import 'rtp_socket.dart';
 
 class VoipSenderG722 {
   final RtpSocket socket;
@@ -15,20 +15,17 @@ class VoipSenderG722 {
     required this.socket,
     required this.remoteIp,
     required this.remotePort,
-  }) : packetizer = G722Packetizer({
-         'ssrc': 5678,
-         'payloadType': 9, // G.722
-       });
+  }) : packetizer = G722Packetizer(
+         RtpPacketizerConfig(ssrc: 5678, payloadType: 9),
+       );
 
   int timestamp = 0;
 
   void sendFrame(Uint8List g722Data) {
     // ✅ Packetize
-    final packets = packetizer.packetize({
-      'data': g722Data,
-      'timestamp': timestamp,
-      'marker': false,
-    });
+    final packets = packetizer.packetize(
+      MediaChunk(data: g722Data, timestampUs: timestamp),
+    );
 
     // ✅ Send packets
     for (final p in packets) {
